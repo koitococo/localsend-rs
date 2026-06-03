@@ -10,7 +10,7 @@ pub mod server;
 pub mod storage;
 
 // Re-export commonly used types for backwards compatibility
-pub use client::LocalSendClient;
+pub use client::{LocalSendClient, TlsTrustPolicy};
 pub use core::{
     DeviceInfoBuilder, Session, TransferState, build_file_metadata, build_file_metadata_from_bytes,
     generate_file_id, get_device_model, get_device_type, get_local_ip, get_mime_type,

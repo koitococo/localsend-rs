@@ -1,3 +1,4 @@
+use crate::client::trust_policy::TlsTrustPolicy;
 use crate::error::{LocalSendError, Result};
 use crate::protocol::{
     DeviceInfo, FileId, FileMetadata, PrepareUploadRequest, PrepareUploadResponse, SessionId, Token,
@@ -17,13 +18,23 @@ pub struct LocalSendClient {
 
 impl LocalSendClient {
     pub fn new(device: DeviceInfo) -> Self {
+        // Historical behavior: accept any self-signed certificate. Prefer
+        // `with_trust_policy` for production usage to require explicit
+        // fingerprint allow-listing.
         Self {
-            // With rustls backend, both use_rustls_tls() and danger_accept_invalid_certs()
-            // are required to accept self-signed certificates.
-            // See: https://github.com/seanmonstar/reqwest/issues/1554
             client: HttpClient::builder()
-                // .use_rustls_tls()
                 .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap_or_else(|_| HttpClient::new()),
+            device,
+        }
+    }
+
+    pub fn with_trust_policy(device: DeviceInfo, policy: TlsTrustPolicy) -> Self {
+        let accept_invalid = policy.allows_insecure();
+        Self {
+            client: HttpClient::builder()
+                .danger_accept_invalid_certs(accept_invalid)
                 .build()
                 .unwrap_or_else(|_| HttpClient::new()),
             device,
@@ -165,5 +176,25 @@ impl LocalSendClient {
                 "File upload failed",
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalSendClient;
+    use crate::client::TlsTrustPolicy;
+    use crate::protocol::{DeviceInfo, Protocol};
+
+    #[test]
+    fn with_trust_policy_keeps_strict_policy_insecure_flag() {
+        let device = DeviceInfo::new("alias".to_string(), 53317, Protocol::Https);
+        let policy = TlsTrustPolicy::new(vec!["trusted-fp".to_string()]);
+
+        let client = LocalSendClient::with_trust_policy(device, policy.clone());
+
+        assert!(!policy.allows_insecure());
+        assert!(!policy.allows(""));
+        // Client must construct without panicking and remain usable for the device payload.
+        assert_eq!(client.device.alias, "alias");
     }
 }
