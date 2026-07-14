@@ -6,6 +6,7 @@ use crate::protocol::{
 use futures_util::StreamExt;
 use reqwest::{Body, Client as HttpClient, StatusCode};
 use std::collections::HashMap;
+#[cfg(feature = "https")]
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
@@ -33,15 +34,26 @@ impl LocalSendClient {
                 .build()
                 .map_err(LocalSendError::from)?,
             TlsTrustPolicy::PinnedFingerprint(fingerprint) => {
-                let verifier = FingerprintVerifier::new(fingerprint)?;
-                let tls_config = rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(verifier))
-                    .with_no_client_auth();
-                HttpClient::builder()
-                    .tls_backend_preconfigured(tls_config)
-                    .build()
-                    .map_err(LocalSendError::from)?
+                #[cfg(feature = "https")]
+                {
+                    let verifier = FingerprintVerifier::new(fingerprint)?;
+                    let tls_config = rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(verifier))
+                        .with_no_client_auth();
+                    HttpClient::builder()
+                        .tls_backend_preconfigured(tls_config)
+                        .build()
+                        .map_err(LocalSendError::from)?
+                }
+
+                #[cfg(not(feature = "https"))]
+                {
+                    let _ = fingerprint;
+                    return Err(LocalSendError::network(
+                        "Pinned LocalSend TLS requires the https feature",
+                    ));
+                }
             }
         };
 
@@ -216,12 +228,14 @@ impl LocalSendClient {
     }
 }
 
+#[cfg(feature = "https")]
 #[derive(Debug)]
 struct FingerprintVerifier {
     expected_fingerprint: String,
     signature_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
 }
 
+#[cfg(feature = "https")]
 impl FingerprintVerifier {
     fn new(expected_fingerprint: String) -> Result<Self> {
         let expected_fingerprint =
@@ -253,6 +267,7 @@ impl FingerprintVerifier {
     }
 }
 
+#[cfg(feature = "https")]
 impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
     fn verify_server_cert(
         &self,
@@ -305,6 +320,7 @@ mod tests {
     use crate::client::TlsTrustPolicy;
     use crate::protocol::{DeviceInfo, Protocol};
 
+    #[cfg(feature = "https")]
     #[test]
     fn with_trust_policy_keeps_strict_policy_insecure_flag() {
         let device = DeviceInfo::new("alias".to_string(), 53317, Protocol::Https);
@@ -316,5 +332,17 @@ mod tests {
         assert!(!policy.allows(""));
         // Client must construct without panicking and remain usable for the device payload.
         assert_eq!(client.device.alias, "alias");
+    }
+
+    #[cfg(not(feature = "https"))]
+    #[test]
+    fn pinned_policy_requires_the_https_feature() {
+        let device = DeviceInfo::new("alias".to_string(), 53317, Protocol::Https);
+        let policy = TlsTrustPolicy::new(vec!["a".repeat(64)]);
+
+        assert!(matches!(
+            LocalSendClient::with_trust_policy(device, policy),
+            Err(error) if error.to_string().contains("https feature")
+        ));
     }
 }

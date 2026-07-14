@@ -1,5 +1,5 @@
-use crate::client::LocalSendClient;
-use crate::core::device::{get_device_model, get_device_type};
+use crate::client::{LocalSendClient, TlsTrustPolicy};
+use crate::core::device::{get_device_model, get_device_type, get_local_ip};
 use crate::crypto::generate_fingerprint;
 use crate::discovery::Discovery;
 use crate::error::LocalSendError;
@@ -7,8 +7,10 @@ use crate::protocol::{
     AnnouncementMessage, DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT, DeviceInfo,
     PROTOCOL_VERSION, Protocol,
 };
+use if_addrs::{IfAddr, get_if_addrs};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
-use std::net::SocketAddr;
+use std::collections::BTreeSet;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -20,8 +22,7 @@ pub type Result<T> = std::result::Result<T, LocalSendError>;
 #[derive(Clone)]
 pub struct MulticastDiscovery {
     local_device: DeviceInfo,
-    client: Option<LocalSendClient>,
-    socket: Option<Arc<UdpSocket>>,
+    sockets: Vec<Arc<UdpSocket>>,
     running: Arc<AtomicBool>,
     tx: Option<broadcast::Sender<DeviceInfo>>,
 }
@@ -46,9 +47,8 @@ impl MulticastDiscovery {
     pub fn new_with_device(device: DeviceInfo) -> Self {
         let (tx, _rx) = broadcast::channel(100);
         Self {
-            local_device: device.clone(),
-            client: Some(LocalSendClient::new(device)),
-            socket: None,
+            local_device: device,
+            sockets: Vec::new(),
             running: Arc::new(AtomicBool::new(false)),
             tx: Some(tx),
         }
@@ -63,107 +63,95 @@ impl Discovery for MulticastDiscovery {
         }
 
         let bind_addr: SocketAddr = format!("0.0.0.0:{}", DEFAULT_MULTICAST_PORT).parse()?;
-        let socket = create_reusable_udp_socket(&bind_addr)?;
-        let multicast_addr: SocketAddr =
-            format!("{}:{}", DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT).parse()?;
-        let multicast_ipv4 = match multicast_addr.ip() {
-            std::net::IpAddr::V4(addr) => addr,
-            _ => {
-                return Err(LocalSendError::network("Multicast address must be IPv4"));
-            }
-        };
-        socket.join_multicast_v4(multicast_ipv4, std::net::Ipv4Addr::new(0, 0, 0, 0))?;
+        let sockets = Self::multicast_interfaces()?
+            .into_iter()
+            .map(|interface| create_reusable_udp_socket(&bind_addr, interface))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>();
 
-        let socket_arc = Arc::new(socket);
-        self.socket = Some(socket_arc.clone());
+        self.sockets = sockets.clone();
         self.running.store(true, Ordering::Relaxed);
 
-        let tx = self.tx.as_ref().unwrap().clone();
+        for socket in sockets {
+            let tx = self.tx.as_ref().unwrap().clone();
+            let local_fingerprint = self.local_device.fingerprint.clone();
+            let running = self.running.clone();
+            let local_device = self.local_device.clone();
 
-        let local_fingerprint = self.local_device.fingerprint.clone();
-        let client = self.client.take().unwrap();
-        let running = self.running.clone();
-        let local_device = self.local_device.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
 
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-
-            while running.load(Ordering::Relaxed) {
-                match tokio::time::timeout(Duration::from_secs(1), socket_arc.recv_from(&mut buf))
-                    .await
-                {
-                    Ok(Ok((len, src))) => {
-                        if len > 0 {
-                            let msg = match String::from_utf8(buf[..len].to_vec()) {
-                                Ok(s) => s,
-                                Err(_) => continue,
-                            };
-
-                            if let Ok(announcement) =
-                                serde_json::from_str::<AnnouncementMessage>(&msg)
-                            {
-                                // Ignore self-announcements
-                                if announcement.fingerprint == local_fingerprint {
-                                    continue;
-                                }
-
-                                let device = DeviceInfo {
-                                    alias: announcement.alias.clone(),
-                                    version: announcement.version.clone(),
-                                    device_model: announcement.device_model.clone(),
-                                    device_type: announcement.device_type,
-                                    fingerprint: announcement.fingerprint.clone(),
-                                    port: announcement.port,
-                                    protocol: announcement.protocol,
-                                    download: announcement.download,
-                                    ip: Some(src.ip().to_string()),
+                while running.load(Ordering::Relaxed) {
+                    match tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
+                        .await
+                    {
+                        Ok(Ok((len, src))) => {
+                            if len > 0 {
+                                let msg = match String::from_utf8(buf[..len].to_vec()) {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
                                 };
 
-                                let is_announcement = announcement.announce
-                                    || announcement.announcement.unwrap_or(false);
+                                if let Ok(announcement) =
+                                    serde_json::from_str::<AnnouncementMessage>(&msg)
+                                {
+                                    if announcement.fingerprint == local_fingerprint {
+                                        continue;
+                                    }
 
-                                // Notify new device
-                                let _ = tx.send(device.clone());
+                                    let device = DeviceInfo {
+                                        alias: announcement.alias.clone(),
+                                        version: announcement.version.clone(),
+                                        device_model: announcement.device_model.clone(),
+                                        device_type: announcement.device_type,
+                                        fingerprint: announcement.fingerprint.clone(),
+                                        port: announcement.port,
+                                        protocol: announcement.protocol,
+                                        download: announcement.download,
+                                        ip: Some(src.ip().to_string()),
+                                    };
 
-                                // If this is an announcement from another device, respond to it
-                                if is_announcement {
-                                    let client = client.clone();
-                                    let local_device = local_device.clone();
-                                    let socket = socket_arc.clone();
+                                    let is_announcement = announcement.announce
+                                        || announcement.announcement.unwrap_or(false);
+                                    let _ = tx.send(device.clone());
 
-                                    tokio::spawn(async move {
-                                        Self::respond_to_announcement(
-                                            &client,
-                                            &device,
-                                            &local_device,
-                                            &socket,
-                                        )
-                                        .await;
-                                    });
+                                    if is_announcement {
+                                        let local_device = local_device.clone();
+                                        let socket = socket.clone();
+
+                                        tokio::spawn(async move {
+                                            Self::respond_to_announcement(
+                                                &device,
+                                                &local_device,
+                                                &socket,
+                                            )
+                                            .await;
+                                        });
+                                    }
                                 }
                             }
                         }
+                        Ok(Err(_)) | Err(_) => continue,
                     }
-                    Ok(Err(_)) | Err(_) => continue, // Continue on timeout or error
                 }
-            }
-        });
+            });
+        }
 
         Ok(())
     }
 
     fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        self.socket = None;
+        self.sockets.clear();
         self.tx = None;
     }
 
     async fn announce_presence(&self) -> std::result::Result<(), LocalSendError> {
-        let socket = if let Some(ref s) = self.socket {
-            s
-        } else {
+        if self.sockets.is_empty() {
             return Err(LocalSendError::network("Discovery not started"));
-        };
+        }
 
         let announcement = AnnouncementMessage {
             alias: self.local_device.alias.clone(),
@@ -187,7 +175,9 @@ impl Discovery for MulticastDiscovery {
         let delays = [100, 500, 2000];
         for delay in delays {
             tokio::time::sleep(Duration::from_millis(delay)).await;
-            socket.send_to(buf, &multicast_addr).await?;
+            for socket in &self.sockets {
+                socket.send_to(buf, &multicast_addr).await?;
+            }
         }
 
         Ok(())
@@ -217,6 +207,67 @@ impl Discovery for MulticastDiscovery {
 }
 
 impl MulticastDiscovery {
+    fn multicast_interfaces() -> Result<Vec<Ipv4Addr>> {
+        let addresses = get_if_addrs()
+            .map_err(|error| {
+                LocalSendError::network(format!("Failed to list interfaces: {error}"))
+            })?
+            .into_iter()
+            .filter(|interface| !interface.is_loopback())
+            .filter_map(|interface| match interface.addr {
+                IfAddr::V4(address) => Some((address.ip, address.netmask)),
+                IfAddr::V6(_) => None,
+            });
+        let addresses = addresses.collect::<Vec<_>>();
+        let primary = get_local_ip().ok();
+        let mut interfaces = Self::multicast_interfaces_from(addresses.iter().copied(), primary);
+
+        if interfaces.is_empty() && primary.is_some() {
+            interfaces = Self::multicast_interfaces_from(addresses, None);
+        }
+
+        if interfaces.is_empty() {
+            Ok(vec![Ipv4Addr::UNSPECIFIED])
+        } else {
+            Ok(interfaces)
+        }
+    }
+
+    fn multicast_interfaces_from(
+        addresses: impl IntoIterator<Item = (Ipv4Addr, Ipv4Addr)>,
+        primary: Option<Ipv4Addr>,
+    ) -> Vec<Ipv4Addr> {
+        addresses
+            .into_iter()
+            .filter(|(address, _)| !address.is_unspecified() && !address.is_loopback())
+            .filter(|(address, netmask)| {
+                primary.is_none_or(|primary| Self::same_subnet(*address, primary, *netmask))
+            })
+            .map(|(address, _)| address)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn same_subnet(address: Ipv4Addr, primary: Ipv4Addr, netmask: Ipv4Addr) -> bool {
+        let netmask = u32::from_be_bytes(netmask.octets());
+        u32::from_be_bytes(address.octets()) & netmask
+            == u32::from_be_bytes(primary.octets()) & netmask
+    }
+
+    fn client_for_announcement(
+        local_device: DeviceInfo,
+        target_device: &DeviceInfo,
+    ) -> Result<LocalSendClient> {
+        match target_device.protocol {
+            Protocol::Http => Ok(LocalSendClient::new(local_device)),
+            Protocol::Https => LocalSendClient::with_trust_policy(
+                local_device,
+                TlsTrustPolicy::PinnedFingerprint(target_device.fingerprint.clone()),
+            ),
+        }
+    }
+
     pub async fn scan(
         &mut self,
         duration: Duration,
@@ -248,7 +299,6 @@ impl MulticastDiscovery {
     }
 
     async fn respond_to_announcement(
-        client: &LocalSendClient,
         target_device: &DeviceInfo,
         local_device: &DeviceInfo,
         socket: &UdpSocket,
@@ -259,20 +309,32 @@ impl MulticastDiscovery {
             target_device.ip
         );
 
-        // Try HTTP registration first
-        match client.register(target_device).await {
-            Ok(_) => {
+        // The discovery announcement contains the peer's certificate fingerprint.
+        // Use it for HTTPS registration instead of system CA verification.
+        match Self::client_for_announcement(local_device.clone(), target_device) {
+            Ok(client) => match client.register(target_device).await {
+                Ok(_) => {
+                    tracing::debug!(
+                        "Successfully registered with {} via HTTP",
+                        target_device.alias
+                    );
+                    return;
+                }
+                Err(error) => {
+                    // If HTTP failed, we just fall back to UDP. This is common if the other device
+                    // has a strict firewall or if we couldn't parse their response.
+                    // It's not a critical error.
+                    tracing::debug!(
+                        "HTTP registration failed ({}), falling back to UDP...",
+                        error
+                    );
+                }
+            },
+            Err(error) => {
                 tracing::debug!(
-                    "Successfully registered with {} via HTTP",
-                    target_device.alias
+                    "Could not configure pinned registration ({}), falling back to UDP...",
+                    error
                 );
-                return;
-            }
-            Err(e) => {
-                // If HTTP failed, we just fall back to UDP. This is common if the other device
-                // has a strict firewall or if we couldn't parse their response.
-                // It's not a critical error.
-                tracing::debug!("HTTP registration failed ({}), falling back to UDP...", e);
             }
         }
 
@@ -315,7 +377,7 @@ impl MulticastDiscovery {
 /// By enabling SO_REUSEADDR (and SO_REUSEPORT on Unix), the OS allows multiple
 /// processes to bind to the same UDP port. For multicast traffic, the OS will
 /// clone incoming packets and deliver them to all participating sockets.
-fn create_reusable_udp_socket(bind_addr: &SocketAddr) -> Result<UdpSocket> {
+fn create_reusable_udp_socket(bind_addr: &SocketAddr, interface: Ipv4Addr) -> Result<UdpSocket> {
     let domain = if bind_addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -340,7 +402,25 @@ fn create_reusable_udp_socket(bind_addr: &SocketAddr) -> Result<UdpSocket> {
         .bind(&(*bind_addr).into())
         .map_err(|e| LocalSendError::network(format!("Failed to bind to {}: {}", bind_addr, e)))?;
 
-    // Convert to tokio UdpSocket
+    let multicast_addr = DEFAULT_MULTICAST_ADDRESS
+        .parse::<Ipv4Addr>()
+        .map_err(|error| {
+            LocalSendError::network(format!(
+                "Invalid multicast address {DEFAULT_MULTICAST_ADDRESS}: {error}"
+            ))
+        })?;
+    socket
+        .join_multicast_v4(&multicast_addr, &interface)
+        .map_err(|error| {
+            LocalSendError::network(format!("Failed to join multicast on {interface}: {error}"))
+        })?;
+    socket.set_multicast_if_v4(&interface).map_err(|error| {
+        LocalSendError::network(format!(
+            "Failed to select multicast interface {interface}: {error}"
+        ))
+    })?;
+
+    // Convert to tokio UdpSocket after configuring the multicast interface.
     let std_socket: std::net::UdpSocket = socket.into();
     std_socket
         .set_nonblocking(true)
@@ -348,4 +428,69 @@ fn create_reusable_udp_socket(bind_addr: &SocketAddr) -> Result<UdpSocket> {
 
     UdpSocket::from_std(std_socket)
         .map_err(|e| LocalSendError::network(format!("Failed to convert to tokio socket: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MulticastDiscovery;
+    use std::net::Ipv4Addr;
+
+    #[cfg(feature = "https")]
+    use crate::{DeviceInfo, LocalSendServer, Protocol};
+
+    #[cfg(feature = "https")]
+    #[tokio::test]
+    async fn announcement_client_pins_the_discovered_https_certificate() {
+        let output = tempfile::tempdir().expect("output directory");
+        let (mut server, _events) = LocalSendServer::builder()
+            .alias("discovered HTTPS peer")
+            .port(0)
+            .save_dir(output.path())
+            .protocol(Protocol::Https)
+            .build()
+            .await
+            .expect("start HTTPS receiver");
+
+        let mut peer = server.device().clone();
+        peer.ip = Some("127.0.0.1".into());
+        let local = DeviceInfo::new("discovery client".into(), 0, Protocol::Https);
+        let client = MulticastDiscovery::client_for_announcement(local, &peer)
+            .expect("build a client for the announced peer");
+
+        client
+            .register(&peer)
+            .await
+            .expect("the announced certificate fingerprint should be pinned");
+
+        server.stop();
+    }
+
+    #[test]
+    fn multicast_uses_each_interface_on_the_primary_lan_only() {
+        assert_eq!(
+            MulticastDiscovery::multicast_interfaces_from(
+                [
+                    (Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(255, 255, 255, 0)),
+                    (Ipv4Addr::LOCALHOST, Ipv4Addr::new(255, 0, 0, 0)),
+                    (
+                        Ipv4Addr::new(192, 168, 6, 10),
+                        Ipv4Addr::new(255, 255, 255, 0),
+                    ),
+                    (
+                        Ipv4Addr::new(192, 168, 6, 101),
+                        Ipv4Addr::new(255, 255, 255, 0),
+                    ),
+                    (
+                        Ipv4Addr::new(192, 168, 139, 3),
+                        Ipv4Addr::new(255, 255, 254, 0),
+                    ),
+                ],
+                Some(Ipv4Addr::new(192, 168, 6, 101))
+            ),
+            vec![
+                Ipv4Addr::new(192, 168, 6, 10),
+                Ipv4Addr::new(192, 168, 6, 101),
+            ]
+        );
+    }
 }
