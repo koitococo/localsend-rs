@@ -175,10 +175,17 @@ pub(crate) async fn handle_prepare_upload(
             }
             if let Some(content) = &file.preview {
                 let now = Local::now();
+                let sender_file_name = file.file_name.replace("/", "_");
+                let extension = if sender_file_name.to_ascii_lowercase().ends_with(".txt") {
+                    ""
+                } else {
+                    ".txt"
+                };
                 let filename = format!(
-                    "message_{}_{}.txt",
+                    "message_{}_{}{}",
                     now.format("%Y%m%d_%H%M%S"),
-                    file.file_name.replace("/", "_")
+                    sender_file_name,
+                    extension,
                 );
                 let path = match crate::core::unique_save_path(&state.save_dir, &filename) {
                     Ok(path) => path,

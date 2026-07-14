@@ -99,6 +99,10 @@ async fn message_path_emits_file_received_and_session_done() {
         recv_file_name.ends_with(".txt"),
         "message file_name should end in .txt, got {recv_file_name}"
     );
+    assert!(
+        !recv_file_name.ends_with(".txt.txt"),
+        "message file_name must not duplicate the sender extension, got {recv_file_name}"
+    );
     assert_eq!(recv_size, message_text.len() as u64);
     assert_eq!(recv_sender, "Test Sender");
     // The event must carry the message body inline so an inbox can render it
