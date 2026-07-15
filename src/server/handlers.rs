@@ -7,7 +7,6 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chrono::Local;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,12 +61,20 @@ pub(crate) async fn handle_prepare_upload(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    // Check if it's a text message (all files have non-empty preview and small size)
-    let is_message = !request.files.is_empty()
-        && request
-            .files
-            .values()
-            .all(|f| f.preview.is_some() && f.size < 1024 * 1024);
+    // LocalSend represents a text message as exactly one small offered item
+    // whose non-empty `preview` is the complete body. Mixed/multi-file offers
+    // remain ordinary file transfers even if one item happens to have preview
+    // metadata.
+    let message_text = if request.files.len() == 1 {
+        request.files.values().next().and_then(|file| {
+            file.preview
+                .as_ref()
+                .filter(|text| !text.is_empty() && file.size < 1024 * 1024)
+                .cloned()
+        })
+    } else {
+        None
+    };
 
     // Short lock: reject a conflicting session, reserve this one with a
     // placeholder session over the *offered* files (replaced below with the
@@ -159,71 +166,15 @@ pub(crate) async fn handle_prepare_upload(
     }
 
     // If it's a message, return 204 No Content
-    if is_message {
+    if let Some(text) = message_text {
         let mut state = state_ref.write().await;
-
-        // Save accepted messages to files. M1 fix: this branch used to save
-        // the message with no ServerEvent at all, so a received text
-        // message was written to disk but never reached the CLI event loop
-        // or the TUI Inbox. Emit the same FileReceived/SessionDone pair
-        // `handle_upload` emits for real files, against the session built
-        // above for this request, so consumers see text messages the same
-        // way they see file transfers.
-        for (file_id, file) in &request.files {
-            if !accepted_ids.contains(file_id) {
-                continue;
-            }
-            if let Some(content) = &file.preview {
-                let now = Local::now();
-                let sender_file_name = file.file_name.replace("/", "_");
-                let extension = if sender_file_name.to_ascii_lowercase().ends_with(".txt") {
-                    ""
-                } else {
-                    ".txt"
-                };
-                let filename = format!(
-                    "message_{}_{}{}",
-                    now.format("%Y%m%d_%H%M%S"),
-                    sender_file_name,
-                    extension,
-                );
-                let path = match crate::core::unique_save_path(&state.save_dir, &filename) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        tracing::warn!("Rejected unsafe message file name: {}", e);
-                        continue;
-                    }
-                };
-                if let Err(e) = std::fs::write(&path, content) {
-                    tracing::error!("Failed to save message to {:?}: {}", path, e);
-                } else {
-                    tracing::info!("Saved message to {:?}", path);
-
-                    // Events must never block the request path: `try_send`,
-                    // not `.send().await` (matches handle_upload). Report
-                    // the *final* on-disk name -- unique_save_path may have
-                    // renamed the file on collision, and a consumer needs
-                    // to see where the bytes actually went.
-                    let final_file_name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| filename.clone());
-                    let _ = state.events_tx.try_send(
-                        crate::server::events::ServerEvent::FileReceived {
-                            session_id: session_id.clone(),
-                            file_id: file_id.clone(),
-                            file_name: final_file_name,
-                            path,
-                            size: content.len() as u64,
-                            sender_alias: request.info.alias.clone(),
-                            // This is the text-message path: carry the body so
-                            // consumers can show it inline in an inbox/log.
-                            message_text: Some(content.clone()),
-                        },
-                    );
-                }
-            }
-        }
+        let _ = state
+            .events_tx
+            .try_send(crate::server::events::ServerEvent::TextReceived {
+                session_id: session_id.clone(),
+                text,
+                sender_alias: request.info.alias.clone(),
+            });
 
         let _ = state
             .events_tx

@@ -11,6 +11,14 @@ pub enum ServerEvent {
     /// A sender wants to transfer files. Respond via the [`PendingRequest`].
     /// Dropping the request (or ignoring it past the accept timeout) declines it.
     TransferRequest(PendingRequest),
+    /// A LocalSend text message accepted from its inline `preview` payload.
+    /// Text is never persisted automatically; consumers may offer explicit
+    /// copy/save actions appropriate to their platform.
+    TextReceived {
+        session_id: SessionId,
+        text: String,
+        sender_alias: String,
+    },
     /// One file finished writing to disk.
     FileReceived {
         session_id: SessionId,
@@ -19,9 +27,8 @@ pub enum ServerEvent {
         path: PathBuf,
         size: u64,
         sender_alias: String,
-        /// The text body when this "file" is a LocalSend text message
-        /// (the sender put the content in `preview`), else `None`. Lets a
-        /// consumer render the message inline instead of opening the `.txt`.
+        /// Retained for source compatibility. First-class text messages are
+        /// emitted as [`ServerEvent::TextReceived`].
         message_text: Option<String>,
     },
     /// All accepted files of a session arrived (or the session was cancelled).

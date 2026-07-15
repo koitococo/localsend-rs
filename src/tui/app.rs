@@ -338,6 +338,14 @@ impl App {
                     // message): stay busy and decline the new request.
                     Some(_) => request.decline(),
                 },
+                ServerEvent::TextReceived {
+                    text, sender_alias, ..
+                } => {
+                    self.status_message = Some((
+                        format!("Message from {sender_alias}: {text}"),
+                        MessageLevel::Success,
+                    ));
+                }
                 ServerEvent::FileReceived {
                     file_name,
                     path,

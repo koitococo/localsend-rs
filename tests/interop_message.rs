@@ -16,11 +16,11 @@ use std::time::Duration;
 /// This drives the real client-side message path (`LocalSendClient::
 /// prepare_upload` with a `FileMetadata` whose `preview` is `Some(text)`,
 /// exactly how `src/cli/commands/send.rs` and the TUI's `send_text_message`
-/// build a text message) and asserts the receiver now emits a
-/// `FileReceived` event for the message file followed by a `SessionDone`,
-/// and that the message content actually landed on disk.
+/// build a text message) and asserts the receiver emits a first-class
+/// `TextReceived` event followed by `SessionDone` without silently writing a
+/// synthetic `.txt` file. Saving is an explicit UI action owned by consumers.
 #[tokio::test(flavor = "multi_thread")]
-async fn message_path_emits_file_received_and_session_done() {
+async fn message_path_emits_text_received_without_saving_and_session_done() {
     let save = tempfile::tempdir().expect("save dir");
 
     let (mut server, mut events) = LocalSendServer::builder()
@@ -75,52 +75,29 @@ async fn message_path_emits_file_received_and_session_done() {
     // Collect events with a bounded wait -- the handler emits them via
     // `try_send` synchronously before responding, but give the receiver
     // loop a moment regardless.
-    let file_received = tokio::time::timeout(Duration::from_secs(5), async {
+    let text_received = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match events.recv().await {
-                Some(ServerEvent::FileReceived {
-                    file_name,
-                    path,
-                    size,
-                    sender_alias,
-                    message_text,
-                    ..
-                }) => return (file_name, path, size, sender_alias, message_text),
+                Some(ServerEvent::TextReceived {
+                    text, sender_alias, ..
+                }) => return (text, sender_alias),
                 Some(_) => continue,
-                None => panic!("event channel closed before FileReceived"),
+                None => panic!("event channel closed before TextReceived"),
             }
         }
     })
     .await
-    .expect("timed out waiting for FileReceived");
+    .expect("timed out waiting for TextReceived");
 
-    let (recv_file_name, recv_path, recv_size, recv_sender, recv_message_text) = file_received;
-    assert!(
-        recv_file_name.ends_with(".txt"),
-        "message file_name should end in .txt, got {recv_file_name}"
-    );
-    assert!(
-        !recv_file_name.ends_with(".txt.txt"),
-        "message file_name must not duplicate the sender extension, got {recv_file_name}"
-    );
-    assert_eq!(recv_size, message_text.len() as u64);
+    let (received_text, recv_sender) = text_received;
     assert_eq!(recv_sender, "Test Sender");
-    // The event must carry the message body inline so an inbox can render it
-    // without re-reading the .txt off disk.
+    assert_eq!(received_text, message_text);
     assert_eq!(
-        recv_message_text.as_deref(),
-        Some(message_text),
-        "FileReceived for a text message must carry message_text"
-    );
-
-    // The FileReceived path must be the FINAL on-disk name -- read it back
-    // and assert the saved content matches the message, not just that a
-    // file exists.
-    let on_disk = std::fs::read_to_string(&recv_path).expect("message file should exist on disk");
-    assert_eq!(on_disk, message_text);
-    assert_eq!(
-        recv_path.file_name().unwrap().to_string_lossy(),
-        recv_file_name
+        std::fs::read_dir(save.path())
+            .expect("read save dir")
+            .count(),
+        0,
+        "accepting a text message must not auto-create a .txt file"
     );
 
     // SessionDone must follow.
