@@ -346,6 +346,9 @@ impl App {
                         MessageLevel::Success,
                     ));
                 }
+                ServerEvent::WebShareRequest(_)
+                | ServerEvent::WebShareDownloadProgress { .. }
+                | ServerEvent::WebShareSessionDone { .. } => {}
                 ServerEvent::FileReceived {
                     file_name,
                     path,

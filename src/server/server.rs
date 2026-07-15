@@ -28,6 +28,7 @@ pub struct LocalSendServer {
     accept_timeout: Duration,
     /// Receiver-side PIN, enforced by `pin::PinGate` in the request handler.
     pin: Option<String>,
+    state: Option<Arc<RwLock<ServerState>>>,
 }
 
 impl LocalSendServer {
@@ -53,6 +54,7 @@ impl LocalSendServer {
             auto_accept: Arc::new(AtomicBool::new(auto_accept)),
             accept_timeout,
             pin,
+            state: None,
         })
     }
 
@@ -152,7 +154,9 @@ impl LocalSendServer {
                     auto_accept: self.auto_accept.clone(),
                     accept_timeout: self.accept_timeout,
                     pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
+                    web_share: None,
                 }));
+                self.state = Some(state.clone());
                 let router = super::routes::create_router(state.clone());
 
                 let server = axum_server::from_tcp_rustls(std_listener, tls_config)
@@ -206,7 +210,9 @@ impl LocalSendServer {
                 auto_accept: self.auto_accept.clone(),
                 accept_timeout: self.accept_timeout,
                 pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
+                web_share: None,
             }));
+            self.state = Some(state.clone());
             let router = super::routes::create_router(state.clone());
 
             let handle = tokio::spawn(async move {
@@ -239,6 +245,69 @@ impl LocalSendServer {
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
+    }
+
+    pub async fn start_web_share(
+        &mut self,
+        files: Vec<super::web_share::WebShareFile>,
+        pin: Option<String>,
+        auto_accept: bool,
+    ) -> crate::Result<()> {
+        if files.is_empty() {
+            return Err(crate::error::LocalSendError::invalid_state(
+                "Web share requires at least one file",
+            ));
+        }
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| crate::error::LocalSendError::invalid_state("Server is not running"))?;
+        let mut state = state.write().await;
+        state.web_share = Some(super::web_share::WebShareState::new(
+            files,
+            pin,
+            auto_accept,
+        ));
+        state.device.download = true;
+        self.device.download = true;
+        Ok(())
+    }
+
+    pub async fn stop_web_share(&mut self) -> crate::Result<()> {
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| crate::error::LocalSendError::invalid_state("Server is not running"))?;
+        let mut state = state.write().await;
+        state.web_share = None;
+        state.device.download = false;
+        self.device.download = false;
+        Ok(())
+    }
+
+    pub async fn respond_web_share(
+        &self,
+        session_id: &crate::protocol::SessionId,
+        accepted: bool,
+    ) -> crate::Result<()> {
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| crate::error::LocalSendError::invalid_state("Server is not running"))?;
+        let mut state = state.write().await;
+        let sender = state
+            .web_share
+            .as_mut()
+            .and_then(|web| web.sessions.get_mut(session_id))
+            .and_then(|session| session.response_tx.take())
+            .ok_or_else(|| {
+                crate::error::LocalSendError::invalid_state(
+                    "Unknown or already answered Web Share request",
+                )
+            })?;
+        sender.send(accepted).map_err(|_| {
+            crate::error::LocalSendError::invalid_state("Web Share requester disconnected")
+        })
     }
 }
 

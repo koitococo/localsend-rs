@@ -19,6 +19,17 @@ pub enum ServerEvent {
         text: String,
         sender_alias: String,
     },
+    /// A browser is waiting for approval to download the active Web Share.
+    WebShareRequest(PendingWebShareRequest),
+    WebShareDownloadProgress {
+        session_id: SessionId,
+        file_id: FileId,
+        bytes_sent: u64,
+        total_bytes: u64,
+    },
+    WebShareSessionDone {
+        session_id: SessionId,
+    },
     /// One file finished writing to disk.
     FileReceived {
         session_id: SessionId,
@@ -32,7 +43,29 @@ pub enum ServerEvent {
         message_text: Option<String>,
     },
     /// All accepted files of a session arrived (or the session was cancelled).
-    SessionDone { session_id: SessionId },
+    SessionDone {
+        session_id: SessionId,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingWebShareRequest {
+    session_id: SessionId,
+    ip: std::net::IpAddr,
+}
+
+impl PendingWebShareRequest {
+    pub(crate) fn new(session_id: SessionId, ip: std::net::IpAddr) -> Self {
+        Self { session_id, ip }
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn ip(&self) -> std::net::IpAddr {
+        self.ip
+    }
 }
 
 /// The consumer's answer to a transfer request.

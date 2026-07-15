@@ -19,6 +19,7 @@ pub struct ServerState {
     pub auto_accept: Arc<AtomicBool>,
     pub accept_timeout: std::time::Duration,
     pub pin_gate: crate::server::pin::PinGate,
+    pub web_share: Option<crate::server::web_share::WebShareState>,
 }
 
 pub(crate) async fn write_body_to_file(body: Body, path: &Path) -> std::io::Result<u64> {

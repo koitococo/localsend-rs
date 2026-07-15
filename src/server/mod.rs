@@ -2,12 +2,14 @@
 
 pub mod events;
 pub mod server;
+pub mod web_share;
 
 pub(crate) mod handlers;
 pub(crate) mod pin;
 pub(crate) mod routes;
 pub(crate) mod state;
 
-pub use events::{PendingRequest, ServerEvent, TransferDecision};
+pub use events::{PendingRequest, PendingWebShareRequest, ServerEvent, TransferDecision};
 pub use server::{LocalSendServer, LocalSendServerBuilder};
 pub use state::ProgressCallback;
+pub use web_share::{WebShareFile, WebShareSource};
