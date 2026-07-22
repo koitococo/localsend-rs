@@ -220,7 +220,7 @@ impl ReceiveProgressContext {
     fn add(&self, amount: u64) {
         let previous = self
             .received_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(amount).min(self.total_bytes))
             })
             .unwrap_or_else(|current| current);
@@ -230,7 +230,7 @@ impl ReceiveProgressContext {
     fn rollback(&self, amount: u64) {
         let previous = self
             .received_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(amount))
             })
             .unwrap_or_else(|current| current);
